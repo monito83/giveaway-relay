@@ -2,8 +2,8 @@ name: Relay Giveaways
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+    - cron: "*/15 * * * *"   # corre cada 15 min
+  workflow_dispatch: {}       # permitir correr a mano
 
 permissions:
   contents: write
@@ -18,6 +18,7 @@ jobs:
         with:
           node-version: "20"
 
+      # (opcional) cachea los browsers de Playwright para acelerar
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
@@ -39,7 +40,12 @@ jobs:
           MENTION_ROLE_ID: ${{ vars.MENTION_ROLE_ID }}
         run: node scraper.js
 
-     - name: Commit del estado si cambió
+      # (opcional) limpia artefactos de npm para no “ensuciar” el repo
+      - name: Limpiar archivos temporales de npm
+        run: rm -rf node_modules package.json package-lock.json
+
+      # commit SOLO si cambió state.json (evita error cuando no hay cambios)
+      - name: Commit del estado si cambió
         run: |
           if ! git diff --quiet -- state.json; then
             git config user.name "github-actions[bot]"
