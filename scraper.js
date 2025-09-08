@@ -1,7 +1,7 @@
 // Node 18+
-// Lee fuentes desde: sources.txt (local), SHEET_CSV_URL (Google Sheet publicada), SOURCES_TXT_URL (Gist/raw)
-// Visita Alphabot/Atlas/Subber públicos, detecta URLs de sorteos y las manda a Discord por Webhook.
-// Evita repetidos con state.json
+// Fuentes: sources.txt (local), SHEET_CSV_URL (Google Sheet CSV), SOURCES_TXT_URL (Gist/raw)
+// Revisa Alphabot/Atlas/Subber públicos, detecta sorteos concretos y postea en Discord por Webhook.
+// Con logs de depuración y sin "fallback" a páginas genéricas.
 
 import fs from "fs/promises";
 import { existsSync } from "fs";
@@ -20,7 +20,7 @@ const MENTION_ROLE_ID = process.env.MENTION_ROLE_ID || "";
 
 const mentionContent = MENTION_ROLE_ID ? `<@&${MENTION_ROLE_ID}>` : "";
 
-// -------- helpers para fuentes --------
+/* -------------------- lectura de fuentes -------------------- */
 async function readLocalTxt() {
   if (!existsSync("sources.txt")) return [];
   const raw = await fs.readFile("sources.txt", "utf8");
@@ -61,13 +61,11 @@ async function readSheetCsv(url) {
 function parseCsv(csv) {
   const out = [];
   const lines = csv.split(/\r?\n/).filter(Boolean);
-  // detección simple de encabezado
   const hasHeader = /name\s*,\s*url/i.test(lines[0]) || /url/i.test(lines[0]);
   const start = hasHeader ? 1 : 0;
   for (let i = start; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) continue;
-    // parse muy simple: name,url  (si solo hay 1 columna asumimos URL)
     const parts = line.split(",");
     if (parts.length >= 2) {
       const name = parts[0].trim();
@@ -81,28 +79,22 @@ function parseCsv(csv) {
   return out;
 }
 
-function isUrl(s) {
-  try { new URL(s); return true; } catch { return false; }
-}
+function isUrl(s) { try { new URL(s); return true; } catch { return false; } }
 
 function dedupeSources(arr) {
-  const seen = new Set();
-  const out = [];
+  const seen = new Set(), out = [];
   for (const it of arr) {
-    if (!seen.has(it.url)) {
-      seen.add(it.url);
-      out.push(it);
-    }
+    if (!seen.has(it.url)) { seen.add(it.url); out.push(it); }
   }
   return out;
 }
 
-// -------- estado --------
+/* -------------------- estado -------------------- */
 let state;
 try { state = JSON.parse(await fs.readFile("state.json", "utf8")); }
 catch { state = { seen: {} }; }
 
-// -------- detección de URLs de sorteo --------
+/* -------------------- detección de URLs de sorteo -------------------- */
 const isRaffleUrl = (raw) => {
   try {
     const u = new URL(raw);
@@ -110,8 +102,7 @@ const isRaffleUrl = (raw) => {
     const p = u.pathname.toLowerCase();
 
     if (h.includes("alphabot.app")) {
-      // SOLO sorteos concretos (evita /_/proyecto y genéricos)
-      // válidos: /r/XXXXX, /raffle/slug, /giveaway/slug, /claim/..., /winners/...
+      // SOLO sorteos concretos (evita /_/proyecto y otras rutas genéricas)
       return /(\/r\/|\/raffle\/|\/giveaway\/|\/claim\/|\/winners?\/)/i.test(p);
     }
     if (h.includes("atlas3.io")) {
@@ -119,7 +110,6 @@ const isRaffleUrl = (raw) => {
       return /\/project\/[^/]+\/giveaway\/[^/]+/i.test(p);
     }
     if (h.includes("subber.xyz")) {
-      // páginas públicas comunes
       return /(allowlist|wallet-collection|posts|campaign|raffle|giveaway)/i.test(p);
     }
     return false;
@@ -139,13 +129,11 @@ async function pickMeta(page) {
 }
 
 async function postToDiscord({sourceName, url, meta}) {
-  // filtro de keywords (si se setea)
   if (KEYWORDS) {
     const hay = (meta?.title || "") + " " + (meta?.description || "") + " " + url;
     const re = new RegExp(KEYWORDS, "i");
-    if (!re.test(hay)) return; // skip si no matchea
+    if (!re.test(hay)) return; // filtrado por keywords
   }
-
   const payload = {
     username: "Giveaways Relay",
     content: mentionContent || undefined,
@@ -163,33 +151,38 @@ async function postToDiscord({sourceName, url, meta}) {
   });
 }
 
-async function loadSources() {
-  const bag = [];
-  bag.push(...await readLocalTxt());
-  bag.push(...await readRemoteTxt(SOURCES_TXT_URL));
-  bag.push(...await readSheetCsv(SHEET_CSV_URL));
-
-  // soporte opcional de sources.json (compatibilidad)
-  if (existsSync("sources.json")) {
-    try {
-      const j = JSON.parse(await fs.readFile("sources.json", "utf8"));
-      for (const it of j) if (isUrl(it.url)) bag.push({ name: it.name || it.url, url: it.url });
-    } catch {}
-  }
-  return dedupeSources(bag);
-}
-
-// -------- main --------
+/* -------------------- main -------------------- */
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 const ctx = await browser.newContext({ userAgent: "Mozilla/5.0 GiveawayRelay" });
 
-const sources = await loadSources();
+// Cargar todas las fuentes y mostrarlas en log
+const sources = dedupeSources([
+  ...(await readLocalTxt()),
+  ...(await readRemoteTxt(SOURCES_TXT_URL)),
+  ...(await readSheetCsv(SHEET_CSV_URL)),
+  ...(existsSync("sources.json") ? JSON.parse(await fs.readFile("sources.json", "utf8")).map(it => ({ name: it.name || it.url, url: it.url })) : [])
+]);
+
+console.log(`Fuentes cargadas: ${sources.length}`);
+sources.forEach((s, i) => console.log(`  [${i+1}] ${s.name} -> ${s.url}`));
+
 let newCount = 0;
 
 for (const src of sources) {
   const page = await ctx.newPage();
+
+  // Captura de URLs desde respuestas de red
+  const respUrls = new Set();
+  page.on("response", r => {
+    const u = r.url();
+    if (isRaffleUrl(u)) respUrls.add(u);
+  });
+
   try {
-    await page.goto(src.url, { waitUntil: "networkidle", timeout: 60000 });
+    console.log(`→ Abriendo: ${src.url}`);
+    // Navegación con fallback: primero DOMContentLoaded, luego intentar networkidle breve
+    await page.goto(src.url, { waitUntil: "domcontentloaded", timeout: 45000 });
+    try { await page.waitForLoadState("networkidle", { timeout: 10000 }); } catch {}
 
     // 1) Juntar links (1ra pasada)
     let links = unique(await page.evaluate(() =>
@@ -197,29 +190,24 @@ for (const src of sources) {
     ));
 
     // 2) Espera corta por contenido dinámico y re-escanea
-    await page.waitForTimeout(3500);
+    await page.waitForTimeout(3000);
     const linksAgain = unique(await page.evaluate(() =>
       Array.from(document.querySelectorAll("a[href]")).map(a => a.href)
     ));
 
-    // 3) Merge de ambas lecturas
-    links = unique([...links, ...linksAgain]);
+    // 3) Merge de ambas lecturas + lo que vino por respuestas de red
+    links = unique([...links, ...linksAgain, ...respUrls]);
+    const candidates = links.filter(isRaffleUrl).slice(0, 120);
 
-    // 4) Filtrar candidatos (solo sorteos reales) y limitar por sanidad
-    const candidates = links.filter(isRaffleUrl).slice(0, 80);
+    console.log(`[${src.name}] links:${links.length} resp:${respUrls.size} candidatos:${candidates.length}`);
 
-    // 5) Publicar solo candidatos (SIN fallback a página genérica)
+    // 4) Publicar solo candidatos (SIN fallback a página genérica)
     for (const url of unique(candidates)) {
       if (state.seen[url]) continue;
 
-      // Primera corrida: sembrar sin postear (evitar spam)
       const firstRun = Object.keys(state.seen).length === 0;
-      if (firstRun) {
-        state.seen[url] = Date.now();
-        continue;
-      }
+      if (firstRun) { state.seen[url] = Date.now(); continue; }
 
-      // Tomar meta desde la página actual; si falta, abrir la URL específica
       let meta = await pickMeta(page);
       if (!meta.title) {
         const p2 = await ctx.newPage();
