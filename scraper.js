@@ -1,41 +1,40 @@
-// Node 18+
-// Fuentes: sources.txt (local), SHEET_CSV_URL (Google Sheet CSV), SOURCES_TXT_URL (Gist/raw)
-// Revisa Alphabot/Atlas/Subber públicos, detecta sorteos concretos y postea en Discord por Webhook.
-// Con crawl suave (profundidad 1), logs de depuración y sin fallback a páginas genéricas.
+// Node 18+ / 20+
+// Fuentes: sources.txt (local), SHEET_CSV_URL (CSV público), SOURCES_TXT_URL (txt/Gist)
+// Detecta sorteos en Alphabot / Atlas3 / Subber y postea en Discord por Webhook.
+// Incluye: re-escaneo, escucha de responses, crawl suave (profundidad 1)
+//          + click de botones "ENTER" en páginas de proyecto de Alphabot.
+// Evita publicar páginas genéricas (solo URLs de sorteos reales).
+// Logs de depuración para ver qué está pasando en cada fuente.
 
 import fs from "fs/promises";
 import { existsSync } from "fs";
 import { chromium } from "playwright";
 
+// === Env requeridos/opcionales ===
 const WEBHOOK = process.env.DISCORD_WEBHOOK_URL;
-if (!WEBHOOK) {
-  console.error("Falta DISCORD_WEBHOOK_URL");
-  process.exit(1);
-}
+if (!WEBHOOK) { console.error("Falta DISCORD_WEBHOOK_URL"); process.exit(1); }
 
-const SHEET_CSV_URL = process.env.SHEET_CSV_URL || "";
-const SOURCES_TXT_URL = process.env.SOURCES_TXT_URL || "";
-const KEYWORDS = (process.env.KEYWORDS || "").trim();
-const MENTION_ROLE_ID = process.env.MENTION_ROLE_ID || "";
+const SHEET_CSV_URL   = process.env.SHEET_CSV_URL || "";   // opcional
+const SOURCES_TXT_URL = process.env.SOURCES_TXT_URL || ""; // opcional
+const KEYWORDS        = (process.env.KEYWORDS || "").trim();// opcional (p.ej. monad|giveaway|raffle|wl)
+const MENTION_ROLE_ID = process.env.MENTION_ROLE_ID || "";  // opcional (rol para @mencionar)
+const mentionContent  = MENTION_ROLE_ID ? `<@&${MENTION_ROLE_ID}>` : "";
 
-const mentionContent = MENTION_ROLE_ID ? `<@&${MENTION_ROLE_ID}>` : "";
-
-// ---------- lectura de fuentes ----------
-async function readLocalTxt() {
+// ========== Lectura de fuentes ==========
+async function readLocalTxt(){
   if (!existsSync("sources.txt")) return [];
   const raw = await fs.readFile("sources.txt", "utf8");
   return parseTxt(raw);
 }
-async function readRemoteTxt(url) {
+async function readRemoteTxt(url){
   if (!url) return [];
-  const res = await fetch(url);
-  if (!res.ok) return [];
-  const raw = await res.text();
-  return parseTxt(raw);
+  const r = await fetch(url);
+  if (!r.ok) return [];
+  return parseTxt(await r.text());
 }
-function parseTxt(raw) {
+function parseTxt(raw){
   const out = [];
-  for (const line of raw.split(/\r?\n/)) {
+  for (const line of raw.split(/\r?\n/)){
     const s = line.trim();
     if (!s || s.startsWith("#")) continue;
     if (s.includes("|")) {
@@ -47,25 +46,24 @@ function parseTxt(raw) {
   }
   return out;
 }
-async function readSheetCsv(url) {
+async function readSheetCsv(url){
   if (!url) return [];
-  const res = await fetch(url);
-  if (!res.ok) return [];
-  const csv = await res.text();
+  const r = await fetch(url);
+  if (!r.ok) return [];
+  const csv = await r.text();
   return parseCsv(csv);
 }
-function parseCsv(csv) {
+function parseCsv(csv){
   const out = [];
   const lines = csv.split(/\r?\n/).filter(Boolean);
   const hasHeader = /name\s*,\s*url/i.test(lines[0]) || /url/i.test(lines[0]);
   const start = hasHeader ? 1 : 0;
-  for (let i = start; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    const parts = line.split(",");
-    if (parts.length >= 2) {
+  for (let i = start; i < lines.length; i++){
+    const parts = lines[i].trim().split(",");
+    if (!parts[0]) continue;
+    if (parts.length >= 2){
       const name = parts[0].trim();
-      const url = parts.slice(1).join(",").trim();
+      const url  = parts.slice(1).join(",").trim();
       if (isUrl(url)) out.push({ name: name || url, url });
     } else {
       const url = parts[0].trim();
@@ -74,21 +72,22 @@ function parseCsv(csv) {
   }
   return out;
 }
-function isUrl(s) { try { new URL(s); return true; } catch { return false; } }
-function dedupeSources(arr) {
+function isUrl(s){ try{ new URL(s); return true; }catch{ return false; } }
+function dedupeSources(arr){
   const seen = new Set(), out = [];
-  for (const it of arr) {
-    if (!seen.has(it.url)) { seen.add(it.url); out.push(it); }
-  }
+  for (const it of arr){ if (!seen.has(it.url)){ seen.add(it.url); out.push(it); } }
   return out;
 }
 
-// ---------- estado ----------
+// ========== Estado ==========
 let state;
-try { state = JSON.parse(await fs.readFile("state.json", "utf8")); }
+try { state = JSON.parse(await fs.readFile("state.json","utf8")); }
 catch { state = { seen: {} }; }
 
-// ---------- detección de URLs de sorteo ----------
+// ========== Detección de URLs de sorteo ==========
+function hasFileExt(path){
+  return /\.[a-z0-9]{1,6}$/i.test(path); // evita .png, .svg, .js, etc
+}
 const isRaffleUrl = (raw) => {
   try {
     const u = new URL(raw);
@@ -96,23 +95,41 @@ const isRaffleUrl = (raw) => {
     const p = u.pathname.toLowerCase();
 
     if (h.includes("alphabot.app")) {
-      // SOLO sorteos concretos (evita /_/proyecto y otras rutas genéricas)
-      return /(\/r\/|\/raffle\/|\/giveaway\/|\/claim\/|\/winners?\/)/i.test(p);
+      // descartar rutas genéricas o con extensión de archivo
+      if (p === "/" || p.startsWith("/_/") || p.startsWith("/login") || hasFileExt(p) ||
+          /\/(tos|terms|privacy|status|support|about|contact|brand|api|pricing|blog)\b/i.test(p)) return false;
+
+      // rutas clásicas de raffle
+      if (/(\/r\/|\/raffle\/|\/giveaway\/|\/claim\/|\/winners?\/)/i.test(p)) return true;
+
+      // slugs "planos" tipo /poply-otters-testnet-mint-33xye5
+      if (/^\/[a-z0-9][a-z0-9-]{2,}$/.test(p)) return true;
+
+      return false;
     }
+
     if (h.includes("atlas3.io")) {
-      // project/<slug>/giveaway/<slug>
+      // /project/<slug>/giveaway/<slug>
       return /\/project\/[^/]+\/giveaway\/[^/]+/i.test(p);
     }
+
     if (h.includes("subber.xyz")) {
-      return /(allowlist|wallet-collection|posts|campaign|raffle|giveaway)/i.test(p);
+      return /(allowlist|wallet-collection|posts|campaign|raffle|giveaway)/i.test(p) && !hasFileExt(p);
     }
+
     return false;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
+};
+const isAlphabotProject = (u) => {
+  try { const x = new URL(u); return x.hostname.includes("alphabot.app") && x.pathname.startsWith("/_/"); }
+  catch { return false; }
 };
 
 const unique = (arr) => [...new Set(arr)];
 
-async function pickMeta(page) {
+async function pickMeta(page){
   const title = (await page.title()) || "";
   const ogTitle = await page.locator('meta[property="og:title"]').getAttribute("content").catch(() => null);
   const ogDesc  = await page.locator('meta[property="og:description"]').getAttribute("content").catch(() => null);
@@ -122,11 +139,10 @@ async function pickMeta(page) {
   };
 }
 
-async function postToDiscord({sourceName, url, meta}) {
-  if (KEYWORDS) {
-    const hay = (meta?.title || "") + " " + (meta?.description || "") + " " + url;
-    const re = new RegExp(KEYWORDS, "i");
-    if (!re.test(hay)) return; // filtrado por keywords
+async function postToDiscord({sourceName, url, meta}){
+  if (KEYWORDS){
+    const hay = `${meta?.title||""} ${meta?.description||""} ${url}`;
+    if (!(new RegExp(KEYWORDS,"i")).test(hay)) return; // filtrado por keywords
   }
   const payload = {
     username: "Giveaways Relay",
@@ -138,29 +154,27 @@ async function postToDiscord({sourceName, url, meta}) {
       timestamp: new Date().toISOString()
     }]
   };
-  await fetch(WEBHOOK, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  await fetch(WEBHOOK, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
 }
 
-// ---------- helper: escaneo de una página ----------
-async function scanCurrentPage(page) {
-  // captura URLs desde respuestas de red (útil en SPAs)
+// ========== Escaneo de una página ==========
+async function scanCurrentPage(page){
+  // captura URLs también desde respuestas de red (útil en SPAs)
   const respUrls = new Set();
   const onResp = (r) => { const u = r.url(); if (isRaffleUrl(u)) respUrls.add(u); };
   page.on("response", onResp);
 
-  // navegación con fallback: DOMContentLoaded + intento de networkidle corto
+  // DOM + intento de networkidle corto
   try { await page.waitForLoadState("domcontentloaded", { timeout: 45000 }); } catch {}
   try { await page.waitForLoadState("networkidle", { timeout: 10000 }); } catch {}
 
   // primera pasada de links
   let links = unique(await page.evaluate(() => Array.from(document.querySelectorAll("a[href]")).map(a => a.href)));
-  // espera por contenido dinámico y segunda pasada
+
+  // esperar contenido dinámico y segunda pasada
   await page.waitForTimeout(3000);
   const linksAgain = unique(await page.evaluate(() => Array.from(document.querySelectorAll("a[href]")).map(a => a.href)));
+
   // merge + respuestas de red
   links = unique([...links, ...linksAgain, ...respUrls]);
 
@@ -168,18 +182,73 @@ async function scanCurrentPage(page) {
   return { links, respCount: respUrls.size };
 }
 
-// ---------- crawl suave (profundidad 1) ----------
-const MAX_CHILD_PAGES = 8; // subir/bajar si querés
-function sameHost(a, b) { try { return new URL(a).host === new URL(b).host; } catch { return false; } }
-function looksPromisingPath(p) {
-  const s = p.toLowerCase();
-  return s.includes("/project/") || s.includes("/giveaway") || s.includes("/r/") || s.includes("/raffle") || s.includes("/_/");
+// ========== Click de "ENTER" en Alphabot (cards) ==========
+async function alphabotClickEnterButtons(page, max = 8){
+  const found = new Set();
+
+  // Algunos botones pueden ser <a> o <button> con distintas mayúsculas
+  const selectors = [
+    'button:has-text("ENTER")',
+    'a:has-text("ENTER")',
+    '[role="button"]:has-text("ENTER")',
+    'button:has-text("Enter")',
+    'a:has-text("Enter")'
+  ];
+
+  // contemos cuántos posibles hay
+  let count = 0;
+  for (const sel of selectors){
+    const c = await page.locator(sel).count().catch(() => 0);
+    count = Math.max(count, c);
+  }
+  const total = Math.min(count, max);
+
+  for (let i = 0; i < total; i++){
+    let loc = null;
+    for (const sel of selectors){
+      const l = page.locator(sel).nth(i);
+      if (await l.count().catch(() => 0)) { loc = l; break; }
+    }
+    if (!loc) continue;
+
+    try {
+      const [ok] = await Promise.all([
+        page.waitForURL(/\/(r|raffle|giveaway|[a-z0-9-]{3,})\//, { timeout: 8000 }).then(() => true).catch(() => false),
+        loc.click({ timeout: 2000 })
+      ]);
+      if (ok){
+        const u = page.url();
+        if (isRaffleUrl(u)) found.add(u);
+        await page.goBack({ waitUntil: "domcontentloaded" });
+        try { await page.waitForLoadState("networkidle", { timeout: 6000 }); } catch {}
+      } else {
+        // segundo intento: click al contenedor padre
+        await loc.evaluate(el => el.closest('a,button,div,article')?.click());
+        const ok2 = await page.waitForURL(/\/(r|raffle|giveaway|[a-z0-9-]{3,})\//, { timeout: 8000 }).then(() => true).catch(() => false);
+        if (ok2){
+          const u = page.url();
+          if (isRaffleUrl(u)) found.add(u);
+          await page.goBack({ waitUntil: "domcontentloaded" });
+          try { await page.waitForLoadState("networkidle", { timeout: 6000 }); } catch {}
+        }
+      }
+    } catch {}
+  }
+  return [...found];
 }
 
-async function collectCandidates(ctx, baseUrl) {
+// ========== Crawl suave (profundidad 1) ==========
+const MAX_CHILD_PAGES = 8;
+function sameHost(a,b){ try { return new URL(a).host === new URL(b).host; } catch { return false; } }
+function looksPromisingPath(p){
+  const s = p.toLowerCase();
+  return s.includes("/project/") || s.includes("/giveaway") || s.includes("/r/") || s.includes("/raffle") || s.startsWith("/_/");
+}
+
+async function collectCandidates(ctx, baseUrl){
   const page = await ctx.newPage();
-  const visited = new Set();
   const candidates = new Set();
+  const visited = new Set();
 
   try {
     await page.goto(baseUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
@@ -188,19 +257,27 @@ async function collectCandidates(ctx, baseUrl) {
     let { links, respCount } = await scanCurrentPage(page);
     const direct = links.filter(isRaffleUrl);
     direct.forEach(u => candidates.add(u));
+    console.log(`[root] links:${links.length} resp:${respCount} cand:${direct.length}`);
 
-    console.log(`[root] links:${links.length} resp:${respCount} candidatos:${direct.length}`);
+    // Si es página de proyecto de Alphabot y no hay candidatos, intentar clickear ENTER
+    if (candidates.size === 0 && isAlphabotProject(baseUrl)){
+      const byClick = await alphabotClickEnterButtons(page, 8);
+      byClick.forEach(u => candidates.add(u));
+      console.log(`[alphabot ENTER] hallados:${byClick.length}`);
+    }
 
-    if (candidates.size === 0) {
-      // explorar hijos del mismo host
+    // Si aún no hay nada, explorar hijos del mismo host que parezcan interesantes
+    if (candidates.size === 0){
       const children = unique(
-        links.filter(u => sameHost(u, baseUrl))
-             .filter(u => !isRaffleUrl(u))
-             .filter(u => { try { const { pathname } = new URL(u); return looksPromisingPath(pathname); } catch { return false; } })
+        links
+          .filter(u => sameHost(u, baseUrl))
+          .filter(u => !isRaffleUrl(u))
+          .filter(u => { try { const { pathname } = new URL(u); return looksPromisingPath(pathname) && !hasFileExt(pathname); } catch { return false; } })
       ).slice(0, MAX_CHILD_PAGES);
 
       console.log(`[crawl] hijos a explorar: ${children.length}`);
-      for (const child of children) {
+
+      for (const child of children){
         if (visited.has(child)) continue;
         visited.add(child);
         const p2 = await ctx.newPage();
@@ -211,15 +288,20 @@ async function collectCandidates(ctx, baseUrl) {
           const hits = cLinks.filter(isRaffleUrl);
           console.log(`[child] ${child} -> links:${cLinks.length} resp:${cResp} cand:${hits.length}`);
           hits.forEach(u => candidates.add(u));
+
+          if (hits.length === 0 && isAlphabotProject(child)){
+            const more = await alphabotClickEnterButtons(p2, 6);
+            console.log(`[alphabot ENTER child] ${child} -> ${more.length}`);
+            more.forEach(u => candidates.add(u));
+          }
         } catch (e) {
           console.log(`[child] error ${child}: ${e.message}`);
         } finally {
           await p2.close();
         }
-        if (candidates.size > 0) break; // con un hallazgo alcanza
+        if (candidates.size > 0) break; // con 1 hallazgo alcanza
       }
     }
-
   } catch (e) {
     console.log(`[root] error ${baseUrl}: ${e.message}`);
   } finally {
@@ -229,7 +311,7 @@ async function collectCandidates(ctx, baseUrl) {
   return [...candidates];
 }
 
-// ---------- main ----------
+// ========== Main ==========
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 const ctx = await browser.newContext({ userAgent: "Mozilla/5.0 GiveawayRelay" });
 
@@ -237,33 +319,33 @@ const sources = dedupeSources([
   ...(await readLocalTxt()),
   ...(await readRemoteTxt(SOURCES_TXT_URL)),
   ...(await readSheetCsv(SHEET_CSV_URL)),
-  ...(existsSync("sources.json") ? JSON.parse(await fs.readFile("sources.json", "utf8")).map(it => ({ name: it.name || it.url, url: it.url })) : [])
+  ...(existsSync("sources.json") ? JSON.parse(await fs.readFile("sources.json","utf8")).map(it => ({ name: it.name || it.url, url: it.url })) : [])
 ]);
 
 console.log(`Fuentes cargadas: ${sources.length}`);
-sources.forEach((s, i) => console.log(`  [${i+1}] ${s.name} -> ${s.url}`));
+sources.forEach((s,i) => console.log(`  [${i+1}] ${s.name} -> ${s.url}`));
 
 let newCount = 0;
 
-for (const src of sources) {
+for (const src of sources){
   console.log(`→ Abriendo: ${src.url}`);
   const urls = await collectCandidates(ctx, src.url);
   console.log(`[${src.name}] candidatos totales: ${urls.length}`);
 
-  for (const url of urls) {
+  for (const url of urls){
     if (state.seen[url]) continue;
 
     const firstRun = Object.keys(state.seen).length === 0;
-    if (firstRun) { state.seen[url] = Date.now(); continue; }
+    if (firstRun){ state.seen[url] = Date.now(); continue; }
 
-    // obtener meta desde la propia URL concreta (más exacto)
+    // abrir la URL concreta para sacar buen título/descr
     let meta = { title: "", description: "" };
     const p2 = await ctx.newPage();
-    try {
+    try{
       await p2.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
       try { await p2.waitForLoadState("networkidle", { timeout: 8000 }); } catch {}
       meta = await pickMeta(p2);
-    } catch {}
+    }catch{}
     await p2.close();
 
     await postToDiscord({ sourceName: src.name, url, meta });
