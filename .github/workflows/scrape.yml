@@ -38,6 +38,7 @@ jobs:
           SOURCES_TXT_URL: ${{ vars.SOURCES_TXT_URL }}
           KEYWORDS: ${{ vars.KEYWORDS }}
           MENTION_ROLE_ID: ${{ vars.MENTION_ROLE_ID }}
+          SEED_ON_EMPTY: ${{ vars.SEED_ON_EMPTY }}
         run: node scraper.js
 
       # (opcional) limpia artefactos de npm para no “ensuciar” el repo
