@@ -18,7 +18,7 @@ const SHEET_CSV_URL   = process.env.SHEET_CSV_URL || "";   // opcional
 const SOURCES_TXT_URL = process.env.SOURCES_TXT_URL || ""; // opcional
 const KEYWORDS        = (process.env.KEYWORDS || "").trim();// opcional (p.ej. monad|giveaway|raffle|wl)
 const MENTION_ROLE_ID = process.env.MENTION_ROLE_ID || "";  // opcional (rol para @mencionar)
-const SEED_ON_EMPTY   = (process.env.SEED_ON_EMPTY || "true").toLowerCase() === "true"; // true=siembra 1ª corrida
+const SEED_ON_EMPTY   = (process.env.SEED_ON_EMPTY || "false").toLowerCase() === "true"; // true=siembra 1ª corrida
 
 const mentionContent  = MENTION_ROLE_ID ? `<@&${MENTION_ROLE_ID}>` : "";
 
