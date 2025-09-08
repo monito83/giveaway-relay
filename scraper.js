@@ -20,6 +20,7 @@ const MENTION_ROLE_ID = process.env.MENTION_ROLE_ID || "";
 
 const mentionContent = MENTION_ROLE_ID ? `<@&${MENTION_ROLE_ID}>` : "";
 
+// -------- helpers para fuentes --------
 async function readLocalTxt() {
   if (!existsSync("sources.txt")) return [];
   const raw = await fs.readFile("sources.txt", "utf8");
@@ -96,10 +97,12 @@ function dedupeSources(arr) {
   return out;
 }
 
+// -------- estado --------
 let state;
 try { state = JSON.parse(await fs.readFile("state.json", "utf8")); }
 catch { state = { seen: {} }; }
 
+// -------- detección de URLs de sorteo --------
 const isRaffleUrl = (raw) => {
   try {
     const u = new URL(raw);
@@ -107,9 +110,9 @@ const isRaffleUrl = (raw) => {
     const p = u.pathname.toLowerCase();
 
     if (h.includes("alphabot.app")) {
-      // Rutas típicas con sorteos en detalle o subpáginas
-      if (p === "/" || p.startsWith("/login")) return false;
-      return /(raffle|raffles|giveaway|claim|r\/|winner|winners)/i.test(p);
+      // SOLO sorteos concretos (evita /_/proyecto y genéricos)
+      // válidos: /r/XXXXX, /raffle/slug, /giveaway/slug, /claim/..., /winners/...
+      return /(\/r\/|\/raffle\/|\/giveaway\/|\/claim\/|\/winners?\/)/i.test(p);
     }
     if (h.includes("atlas3.io")) {
       // project/<slug>/giveaway/<slug>
@@ -149,7 +152,7 @@ async function postToDiscord({sourceName, url, meta}) {
     embeds: [{
       title: meta?.title || "Nuevo sorteo",
       url,
-      description: (meta?.description ? meta.description + "\\n\\n" : "") + `📌 Fuente: **${sourceName}**`,
+      description: (meta?.description ? meta.description + "\n\n" : "") + `📌 Fuente: **${sourceName}**`,
       timestamp: new Date().toISOString()
     }]
   };
@@ -176,6 +179,7 @@ async function loadSources() {
   return dedupeSources(bag);
 }
 
+// -------- main --------
 const browser = await chromium.launch({ args: ["--no-sandbox"] });
 const ctx = await browser.newContext({ userAgent: "Mozilla/5.0 GiveawayRelay" });
 
@@ -187,15 +191,25 @@ for (const src of sources) {
   try {
     await page.goto(src.url, { waitUntil: "networkidle", timeout: 60000 });
 
-    // Juntar links
-    const links = unique(await page.evaluate(() => Array.from(document.querySelectorAll("a[href]")).map(a => a.href)));
+    // 1) Juntar links (1ra pasada)
+    let links = unique(await page.evaluate(() =>
+      Array.from(document.querySelectorAll("a[href]")).map(a => a.href)
+    ));
 
-    // Filtrar candidatos
+    // 2) Espera corta por contenido dinámico y re-escanea
+    await page.waitForTimeout(3500);
+    const linksAgain = unique(await page.evaluate(() =>
+      Array.from(document.querySelectorAll("a[href]")).map(a => a.href)
+    ));
+
+    // 3) Merge de ambas lecturas
+    links = unique([...links, ...linksAgain]);
+
+    // 4) Filtrar candidatos (solo sorteos reales) y limitar por sanidad
     const candidates = links.filter(isRaffleUrl).slice(0, 80);
-    // Si la propia URL parece ser un giveaway y no hay links, usar self
-    const fallbackSelf = candidates.length === 0 && isRaffleUrl(src.url) ? [src.url] : [];
 
-    for (const url of unique([...candidates, ...fallbackSelf])) {
+    // 5) Publicar solo candidatos (SIN fallback a página genérica)
+    for (const url of unique(candidates)) {
       if (state.seen[url]) continue;
 
       // Primera corrida: sembrar sin postear (evitar spam)
@@ -205,6 +219,7 @@ for (const src of sources) {
         continue;
       }
 
+      // Tomar meta desde la página actual; si falta, abrir la URL específica
       let meta = await pickMeta(page);
       if (!meta.title) {
         const p2 = await ctx.newPage();
