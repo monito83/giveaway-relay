@@ -12,7 +12,10 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
+      # Checkout con historial completo (necesario para pull --rebase)
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -38,22 +41,33 @@ jobs:
           SOURCES_TXT_URL: ${{ vars.SOURCES_TXT_URL }}
           KEYWORDS: ${{ vars.KEYWORDS }}
           MENTION_ROLE_ID: ${{ vars.MENTION_ROLE_ID }}
-          SEED_ON_EMPTY: ${{ vars.SEED_ON_EMPTY }}
+          SEED_ON_EMPTY: ${{ vars.SEED_ON_EMPTY }}   # poné "false" para publicar en la 1ª corrida
         run: node scraper.js
 
       # (opcional) limpia artefactos de npm para no “ensuciar” el repo
       - name: Limpiar archivos temporales de npm
         run: rm -rf node_modules package.json package-lock.json
 
-      # commit SOLO si cambió state.json (evita error cuando no hay cambios)
+      # Commit robusto del estado: hace pull --rebase antes de pushear
       - name: Commit del estado si cambió
+        env:
+          BRANCH_NAME: ${{ github.ref_name }}
         run: |
           if ! git diff --quiet -- state.json; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            # Traer últimos cambios y rebase para evitar non-fast-forward
+            git fetch origin "$BRANCH_NAME"
+            git checkout "$BRANCH_NAME"
+            if ! git pull --rebase origin "$BRANCH_NAME"; then
+              git rebase --abort || true
+              git reset --hard "origin/$BRANCH_NAME"
+            fi
+
             git add state.json
-            git commit -m "update state [skip ci]"
-            git push
+            git commit -m "update state [skip ci]" || echo "Nada que commitear"
+            git push origin HEAD:"$BRANCH_NAME"
           else
             echo "Sin cambios en state.json"
           fi
